@@ -41,6 +41,7 @@ pub struct Stats {
     pub status_other: AtomicUsize,
     pub active_ips: DashMap<IpAddr, usize>,
     pub ip_errors: DashMap<IpAddr, usize>,
+    pub ip_success: DashMap<IpAddr, usize>, // Reputation: Track successful requests
     // Rate Limiting: (Window Start Time, Request Count)
     pub ip_rate_limits: DashMap<IpAddr, (Instant, usize)>,
     pub blocked_set: Mutex<HashSet<IpAddr>>,
@@ -58,6 +59,14 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 
 pub type HttpClient = Client<HttpConnector, Incoming>;
+
+const RATE_LIMIT_REQ_PER_SEC: usize = 100;
+const RATE_LIMIT_TRUSTED_REQ_PER_SEC: usize = 500;
+const TRUSTED_SUCCESS_THRESHOLD: usize = 1000;
+const MAX_ERRORS_BEFORE_BAN: usize = 10;
+const TARPIT_DELAY_SECONDS: u64 = 10;
+const REPUTATION_HISTORY_SIZE: usize = 3;
+// -------------------------------
 
 pub async fn handle_client(
     req: Request<Incoming>,
@@ -89,7 +98,7 @@ pub async fn handle_client(
 
             if is_blocked {
                  // TARPIT: Waste the attacker's time!
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(TARPIT_DELAY_SECONDS)).await;
                 
                 return Ok(Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -109,7 +118,18 @@ pub async fn handle_client(
                 *count = 1;
             } else {
                 *count += 1;
-                if *count > 100 {
+                
+                // FLOOD PROTECTION with "Good Student" Allowance
+                let mut limit = RATE_LIMIT_REQ_PER_SEC; // Base limit
+                
+                // Boost limit for trusted users (more than 1000 successes)
+                if let Some(success_count) = stats.ip_success.get(&client_addr.ip()) {
+                     if *success_count > TRUSTED_SUCCESS_THRESHOLD {
+                         limit = RATE_LIMIT_TRUSTED_REQ_PER_SEC; // VIP Limit for trusted IPs
+                     }
+                }
+
+                if *count > limit {
                     // BLOCK!
                     let mut new_block = false;
                     if let Ok(mut set) = stats.blocked_set.lock() {
@@ -117,7 +137,7 @@ pub async fn handle_client(
                             new_block = true;
                             // Add to history
                             if let Ok(mut hist) = stats.blocked_history.lock() {
-                                if hist.len() >= 3 { hist.remove(0); }
+                                if hist.len() >= REPUTATION_HISTORY_SIZE { hist.remove(0); }
                                 hist.push(client_addr.ip());
                             }
                         }
@@ -136,7 +156,7 @@ pub async fn handle_client(
     }
 
     if let Some(count) = stats.ip_errors.get(&client_addr.ip()) {
-        if *count > 10 {
+        if *count > MAX_ERRORS_BEFORE_BAN {
             // ... (Existing Error Block Logic) ...
             // Check if we already logged this block to avoid spam
             let mut new_block = false;
@@ -145,7 +165,7 @@ pub async fn handle_client(
                     new_block = true;
                     // Add to history (keep last 3)
                     if let Ok(mut hist) = stats.blocked_history.lock() {
-                        if hist.len() >= 3 { hist.remove(0); }
+                        if hist.len() >= REPUTATION_HISTORY_SIZE { hist.remove(0); }
                         hist.push(client_addr.ip());
                     }
                 }
@@ -181,12 +201,16 @@ pub async fn handle_client(
     };
 
     // Check with our control module (Flow Control)
-    if let control::Action::Deny = control::check_flow(&req) {
+    if let control::Action::Deny(reason) = control::check_flow(&req) {
          stats.status_4xx.fetch_add(1, Ordering::Relaxed);
-         log_status(StatusCode::FORBIDDEN);
+         
+         // Log the WAF Block
+         let log_msg = format!("WAF BLOCKED [{}]: {}", client_addr.ip(), reason);
+         let _ = log_tx.send(LogEntry { level: LogLevel::Error, message: log_msg });
+         
          return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
-            .body(full("Blocked by proxy rules"))
+            .body(full(format!("Blocked by WAF: {}", reason)))
             .unwrap());
     }
 
@@ -217,21 +241,30 @@ pub async fn handle_client(
                 .unwrap())
         }
     } else {
-        // Standard HTTP Proxy - USE IMPLICIT http_client passing? 
-        // No, we use the passed http_client now.
-        // let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        //    .build(hyper_util::client::legacy::connect::HttpConnector::new());
+        // Standard HTTP Proxy
 
         match http_client.request(req).await {
              Ok(res) => {
-                 let status = res.status();
-                 log_status(status);
+                  let status = res.status();
+                  log_status(status);
 
-                 if !status.is_success() {
-                     *stats.ip_errors.entry(client_addr.ip()).or_default() += 1;
-                 }
+                  if !is_benchmark {
+                      // REPUTATION REPAIR: Good behavior (2xx OR 3xx) heals past errors
+                      // 304 Not Modified is crucial for browsers!
+                      if status.is_success() || status.is_redirection() {
+                          // Track SUCCESS for Reputation/Burst
+                          *stats.ip_success.entry(client_addr.ip()).or_default() += 1;
+                          
+                          if let Some(mut count) = stats.ip_errors.get_mut(&client_addr.ip()) {
+                              if *count > 0 { *count -= 1; }
+                          }
+                      } else if status.is_client_error() || status.is_server_error() {
+                          // Only punish actual errors (4xx/5xx), ignore redirects (3xx)
+                          *stats.ip_errors.entry(client_addr.ip()).or_default() += 1;
+                      }
+                  }
 
-                 match status.as_u16() {
+                  match status.as_u16() {
                      200..=299 => { if !is_benchmark { stats.status_2xx.fetch_add(1, Ordering::Relaxed); }},
                      400..=499 => { if !is_benchmark { stats.status_4xx.fetch_add(1, Ordering::Relaxed); }},
                      500..=599 => { if !is_benchmark { stats.status_5xx.fetch_add(1, Ordering::Relaxed); }},

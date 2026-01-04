@@ -7,7 +7,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use std::sync::atomic::Ordering;
-use std::io;
+use std::io::{self, Write};
+use std::fs::OpenOptions;
 use std::time::Duration;
 use syslog::{Facility, Formatter3164};
 
@@ -103,10 +104,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  }
              }
              Err(e) => {
-                 eprintln!("Failed to connect to syslog: {}", e);
-                 // Fallback to stdout
-                 while let Some(entry) = log_rx.recv().await {
-                     println!("[{}] {}", if matches!(entry.level, proxy::LogLevel::Error) {"ERR"} else {"INFO"}, entry.message);
+                 eprintln!("Failed to connect to syslog: {}. Falling back to 'propox.log'", e);
+                 
+                 // Fallback to File
+                 match OpenOptions::new().create(true).append(true).open("propox.log") {
+                     Ok(mut file) => {
+                         while let Some(entry) = log_rx.recv().await {
+                             let line = format!("[{}] {}\n", 
+                                if matches!(entry.level, proxy::LogLevel::Error) {"ERR"} else {"INFO"}, 
+                                entry.message);
+                             let _ = file.write_all(line.as_bytes());
+                         }
+                     },
+                     Err(file_err) => {
+                         eprintln!("Failed to open propox.log: {}. Falling back to stdout.", file_err);
+                         // Fallback to stdout (last resort)
+                         while let Some(entry) = log_rx.recv().await {
+                             println!("[{}] {}", if matches!(entry.level, proxy::LogLevel::Error) {"ERR"} else {"INFO"}, entry.message);
+                         }
+                     }
                  }
              }
         }

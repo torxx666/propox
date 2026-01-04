@@ -10,13 +10,28 @@
 ### 🚀 Extreme Performance
 - **Optimized Concurrency**: Built on **Tokio** and **Hyper** for non-blocking I/O.
 - **Lock-Free State**: Uses **DashMap** to eliminate lock contention on hot paths.
-- **Connection Pooling**:reuses TCP connections to the backend (Keep-Alive), achieving **~28,000 RPS** on local benchmarks.
+- **Connection Pooling**: Reuses TCP connections to the backend (Keep-Alive).
+- **Benchmarks**:
+    - **Standard Mode**: ~14,000 RPS (Requests Per Second).
+    - **Benchmark Mode**: ~28,000 RPS (Raw throughput).
 
 ### 🛡️ Active Defense System
 Propox doesn't just pass traffic; it protects your backend:
-1.  **Dynamic IP Blocking**: Automatically bans IPs generating excessive errors (>10 non-2xx responses).
-2.  **Rate Limiting (Flood Protection)**: Detects and blocks IPs exceeding **100 requests/second**, even if requests are valid.
-3.  **Tarpit Defense**: 🐌 Intentionally delays responses to blocked IPs by **10 seconds**, exhausting attacker resources (threads/sockets) and neutralizing scanners.
+1.  **Rate Limiting**: Base limit of **100 req/s**. Blocks flooding attempts.
+2.  **Trusted Bursting**: "Good Students" (>1000 successes) get VIP access (**500 req/s**).
+3.  **Reputation System**: Valid requests heal your reputation. Too many 404s/500s (>10) ban you.
+4.  **Tarpit**: Blocked IPs are artificially delayed by **10 seconds** to waste attacker resources.
+5.  **WAF (Layer 7)**:
+    - **Anti-Bot**: Blocks `sqlmap`, `nikto`, `curl`, `python` UA.
+    - **Anti-Injection**: Blocks `UNION SELECT`, `OR 1=1`, `<script>` in URLs.
+    - **Path Protection**: Blocks `.env`, `.git`, `/admin`.
+
+### ⚙️ Configuration
+Performance thresholds are configurable in `src/proxy.rs`:
+```rust
+const RATE_LIMIT_ReqPerSec: usize = 100;
+const MAX_ERRORS_BEFORE_BAN: usize = 10;
+```
 
 ### 📊 Real-Time Observability (TUI)
 Includes a professional **Terminal User Interface** (built with Ratatui) displaying:
@@ -45,7 +60,10 @@ cargo run --release -- --errors
 # 🏎️ Benchmark Mode (Disables Security for Raw Performance Testing)
 cargo run --release -- --benchmark
 
-# 👻 Daemon Mode (No TUI, Logs to Syslog)
+# 👻 Daemon Mode (Background)
+# - No TUI, minimal resource usage.
+# - Logs to Syslog (/var/log/syslog).
+# - Auto-fallback to 'propox.log' if syslog is missing (common in WSL/Docker).
 cargo run --release -- --daemon
 ```
 
